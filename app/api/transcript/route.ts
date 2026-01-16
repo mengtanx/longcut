@@ -19,9 +19,129 @@ function respondWithNoCredits(
   );
 }
 
+// Helper function to fetch transcript from Supadata
+async function fetchTranscriptFromSupadata(
+  videoId: string,
+  apiKey: string,
+  lang?: string
+): Promise<{
+  segments: any[] | null;
+  language?: string;
+  availableLanguages?: string[];
+  status: number;
+  error?: string;
+}> {
+  const apiUrl = new URL('https://api.supadata.ai/v1/transcript');
+  apiUrl.searchParams.set('url', `https://www.youtube.com/watch?v=${videoId}`);
+  if (lang) {
+    apiUrl.searchParams.set('lang', lang);
+  }
+
+  const response = await fetch(apiUrl.toString(), {
+    method: 'GET',
+    headers: {
+      'x-api-key': apiKey,
+      'Content-Type': 'application/json'
+    }
+  });
+
+  const responseText = await response.text();
+  let parsedBody: Record<string, unknown> | null = null;
+
+  if (responseText) {
+    try {
+      parsedBody = JSON.parse(responseText);
+    } catch {
+      parsedBody = null;
+    }
+  }
+
+  if (!response.ok || response.status === 206) {
+    return {
+      segments: null,
+      status: response.status,
+      error: typeof parsedBody?.error === 'string' ? parsedBody.error : 'Failed to fetch transcript'
+    };
+  }
+
+  const candidateContent = Array.isArray(parsedBody?.content)
+    ? parsedBody?.content
+    : Array.isArray(parsedBody?.transcript)
+      ? parsedBody?.transcript
+      : Array.isArray(parsedBody)
+        ? parsedBody
+        : null;
+
+  return {
+    segments: candidateContent,
+    language: typeof parsedBody?.lang === 'string' ? parsedBody.lang : undefined,
+    availableLanguages: Array.isArray(parsedBody?.availableLangs)
+      ? parsedBody.availableLangs.filter((l): l is string => typeof l === 'string')
+      : undefined,
+    status: response.status
+  };
+}
+
+// Helper function to transform raw segments
+// Supadata can return timestamps in either milliseconds (offset > 1000) or seconds (offset < 100)
+// We need to detect the format and normalize to seconds
+function transformSegments(transcriptSegments: any[]): { text: string; start: number; duration: number }[] {
+  if (transcriptSegments.length === 0) return [];
+
+  // Detect if timestamps are in milliseconds or seconds
+  // Sample the first few segments to determine the format
+  const sampleSize = Math.min(5, transcriptSegments.length);
+  let totalOffset = 0;
+  let offsetCount = 0;
+
+  for (let i = 0; i < sampleSize; i++) {
+    const item = transcriptSegments[i];
+    if (item.offset !== undefined && item.offset > 0) {
+      totalOffset += item.offset;
+      offsetCount++;
+    } else if (item.start !== undefined && item.start > 0) {
+      totalOffset += item.start;
+      offsetCount++;
+    }
+  }
+
+  // If average offset/start is > 1000, values are likely in milliseconds
+  // If average is < 1000, values are likely in seconds
+  // For a 5-segment sample at the start of a video, if values are in milliseconds,
+  // we'd expect offsets in the thousands (e.g., 5000ms = 5s)
+  // If values are in seconds, we'd expect offsets < 100 (e.g., 5s, 10s)
+  const avgOffset = offsetCount > 0 ? totalOffset / offsetCount : 0;
+  const isMilliseconds = avgOffset > 500; // If avg > 500, likely milliseconds
+
+  console.log('[TRANSCRIPT] Timestamp format detection:', {
+    avgOffset,
+    isMilliseconds,
+    sampleValues: transcriptSegments.slice(0, 3).map(s => ({ offset: s.offset, start: s.start, duration: s.duration }))
+  });
+
+  return transcriptSegments.map((item) => {
+    const rawOffset = item.offset !== undefined ? item.offset : item.start;
+    const rawDuration = item.duration !== undefined ? item.duration : 0;
+
+    return {
+      text: item.text || item.content || '',
+      // Convert to seconds if values are in milliseconds
+      start: isMilliseconds ? (rawOffset || 0) / 1000 : (rawOffset || 0),
+      duration: isMilliseconds ? (rawDuration || 0) / 1000 : (rawDuration || 0)
+    };
+  });
+}
+
+// Calculate transcript duration from segments
+function calculateTranscriptDuration(segments: { start: number; duration: number }[]): number {
+  if (segments.length === 0) return 0;
+  const lastSegment = segments[segments.length - 1];
+  return lastSegment.start + lastSegment.duration;
+}
+
 async function handler(request: NextRequest) {
   try {
-    const { url, lang } = await request.json();
+    const { url, lang, expectedDuration } = await request.json();
 
     if (!url) {
       return respondWithNoCredits({ error: 'YouTube URL is required' }, 400);
@@ -66,165 +186,127 @@ async function handler(request: NextRequest) {
       return respondWithNoCredits({ error: 'API configuration error' }, 500);
     }
 
-    let transcriptSegments: any[] | null = null;
-    let language: string | undefined;
-    let availableLanguages: string[] | undefined;
+    // Fetch transcript with retry logic for incomplete results
+    let bestResult: {
+      segments: any[];
+      language?: string;
+      availableLanguages?: string[];
+      langUsed?: string;
+    } | null = null;
 
-    try {
-      const apiUrl = new URL('https://api.supadata.ai/v1/transcript');
-      apiUrl.searchParams.set('url', `https://www.youtube.com/watch?v=${videoId}`);
-      if (lang) {
-        apiUrl.searchParams.set('lang', lang);
-      } else {
-        // Default to English if not specified, but this might need revisiting if we want auto-detection without preference
-        // Supadata defaults to 'en' if not specified anyway, or auto-detects.
-        // If we want auto-detect, we should probably not send lang unless the user picked one.
-        // However, the original code hardcoded `&lang=en`.
-        // To support "Any language", we can omit it, OR set it to the requested one.
-        // For backward compatibility/consistency, maybe default to 'en' only if absolutely needed,
-        // but removing it allows Supadata to return whatever is native.
-        // BUT, Supadata docs say "lang: Preferred language code... If video does not have transcript in preferred language, endpoint will return transcript in first available language".
-        // So passing 'en' is safe as a default preference.
-        apiUrl.searchParams.set('lang', 'en');
-      }
+    // Languages to try: first auto-detect, then explicit 'en', then other available languages
+    const languagesToTry: (string | undefined)[] = [lang]; // Start with user-specified or auto-detect
 
-      const response = await fetch(
-        apiUrl.toString(),
-        {
-          method: 'GET',
-          headers: {
-            'x-api-key': apiKey,
-            'Content-Type': 'application/json'
+    for (const langToTry of languagesToTry) {
+      console.log(`[TRANSCRIPT] Attempting fetch for ${videoId} with lang=${langToTry ?? 'auto-detect'}`);
+
+      const result = await fetchTranscriptFromSupadata(videoId, apiKey, langToTry);
+
+      if (result.segments && result.segments.length > 0) {
+        // Log raw segment data from Supadata for debugging
+        console.log('[TRANSCRIPT] Raw Supadata segments (first 3):', {
+          videoId,
+          langUsed: langToTry ?? 'auto-detect',
+          sampleSegments: result.segments.slice(0, 3).map(s => ({
+            text: s.text?.substring(0, 50) || s.content?.substring(0, 50),
+            offset: s.offset,
+            start: s.start,
+            duration: s.duration
+          }))
+        });
+
+        const rawSegments = transformSegments(result.segments);
+        const duration = calculateTranscriptDuration(rawSegments);
+
+        console.log('[TRANSCRIPT] Supadata response:', {
+          videoId,
+          status: result.status,
+          segmentCount: result.segments.length,
+          transcriptDuration: Math.round(duration),
+          language: result.language,
+          langUsed: langToTry ?? 'auto-detect',
+          availableLanguages: result.availableLanguages
+        });
+
+        // Check if this is a better result than what we have
+        if (!bestResult) {
+          bestResult = {
+            segments: result.segments,
+            language: result.language,
+            availableLanguages: result.availableLanguages,
+            langUsed: langToTry
+          };
+
+          // If transcript seems complete (covers expected duration reasonably), use it
+          // Otherwise, try other languages
+          if (expectedDuration && duration >= expectedDuration * 0.5) {
+            console.log(`[TRANSCRIPT] Transcript covers ${Math.round(duration / expectedDuration * 100)}% of expected duration, accepting`);
+            break;
+          } else if (!expectedDuration) {
+            // No expected duration provided, use first successful result
+            // But if available languages exist and transcript is suspiciously short, try alternatives
+            if (result.availableLanguages && result.availableLanguages.length > 1 && duration < 300) {
+              // Less than 5 minutes, might be incomplete - add other languages to try
+              for (const altLang of result.availableLanguages) {
+                if (altLang !== langToTry && !languagesToTry.includes(altLang)) {
+                  languagesToTry.push(altLang);
+                }
+              }
+              // Also try explicit 'en' if not already tried
+              if (langToTry !== 'en' && !languagesToTry.includes('en')) {
+                languagesToTry.push('en');
+              }
+            } else {
+              break;
+            }
+          } else {
+            // Transcript too short, try other languages
+            console.log(`[TRANSCRIPT] Transcript only covers ${Math.round(duration / expectedDuration * 100)}% of expected duration, trying other languages`);
+            // Add available languages to try
+            if (result.availableLanguages) {
+              for (const altLang of result.availableLanguages) {
+                if (altLang !== langToTry && !languagesToTry.includes(altLang)) {
+                  languagesToTry.push(altLang);
+                }
+              }
+            }
+            // Also try explicit 'en' if not already tried
+            if (langToTry !== 'en' && !languagesToTry.includes('en')) {
+              languagesToTry.push('en');
+            }
+          }
+        } else {
+          // Compare with existing best result
+          const bestRawSegments = transformSegments(bestResult.segments);
+          const bestDuration = calculateTranscriptDuration(bestRawSegments);
+
+          if (duration > bestDuration) {
+            console.log(`[TRANSCRIPT] Found better result: ${Math.round(duration)}s vs ${Math.round(bestDuration)}s`);
+            bestResult = {
+              segments: result.segments,
+              language: result.language,
+              availableLanguages: result.availableLanguages,
+              langUsed: langToTry
+            };
           }
         }
-      );
-
-      const responseText = await response.text();
-
-      let parsedBody: Record<string, unknown> | null = null;
-
-      if (responseText) {
-        try {
-          parsedBody = JSON.parse(responseText);
-        } catch {
-          parsedBody = null;
-        }
+      } else if (result.status === 404) {
+        console.log(`[TRANSCRIPT] No transcript available with lang=${langToTry ?? 'auto-detect'}`);
+      } else {
+        console.log(`[TRANSCRIPT] Failed to fetch with lang=${langToTry ?? 'auto-detect'}: ${result.error}`);
       }
-
-      const combinedErrorFields = [
-        typeof parsedBody?.error === 'string' ? parsedBody.error : null,
-        typeof parsedBody?.message === 'string' ? parsedBody.message : null,
-        typeof parsedBody?.details === 'string' ? parsedBody.details : null,
-        responseText || null
-      ].filter(Boolean) as string[];
-
-      const hasSupadataError =
-        typeof parsedBody?.error === 'string' &&
-        parsedBody.error.trim().length > 0;
-
-      const supadataStatusMessage =
-        typeof parsedBody?.message === 'string' &&
-          parsedBody.message.trim().length > 0
-          ? parsedBody.message.trim()
-          : 'Transcript Unavailable';
-
-      const supadataDetails =
-        typeof parsedBody?.details === 'string' &&
-          parsedBody.details.trim().length > 0
-          ? parsedBody.details.trim()
-          : 'No transcript is available for this video.';
-
-      if (!response.ok) {
-        if (response.status === 404) {
-          return respondWithNoCredits(
-            {
-              error:
-                'No transcript/captions available for this video. The video may not have subtitles enabled.'
-            },
-            404
-          );
-        }
-
-        throw new Error(
-          `Supadata transcript request failed (${response.status})${combinedErrorFields.length > 0
-            ? `: ${combinedErrorFields.join(' ')}`
-            : ''
-          }`
-        );
-      }
-
-      if (response.status === 206 || hasSupadataError) {
-        return respondWithNoCredits(
-          {
-            error: supadataStatusMessage,
-            details: supadataDetails
-          },
-          404
-        );
-      }
-
-      const candidateContent = Array.isArray(parsedBody?.content)
-        ? parsedBody?.content
-        : Array.isArray(parsedBody?.transcript)
-          ? parsedBody?.transcript
-          : Array.isArray(parsedBody)
-            ? parsedBody
-            : null;
-
-      if (!candidateContent || candidateContent.length === 0) {
-        return respondWithNoCredits(
-          {
-            error: supadataStatusMessage,
-            details: supadataDetails
-          },
-          404
-        );
-      }
-
-      transcriptSegments = candidateContent;
-      language = typeof parsedBody?.lang === 'string' ? parsedBody.lang : undefined;
-      availableLanguages = Array.isArray(parsedBody?.availableLangs)
-        ? parsedBody.availableLangs.filter((l): l is string => typeof l === 'string')
-        : undefined;
-
-    } catch (fetchError) {
-      const errorMessage =
-        fetchError instanceof Error ? fetchError.message : '';
-      if (errorMessage.includes('404')) {
-        return respondWithNoCredits(
-          {
-            error:
-              'No transcript/captions available for this video. The video may not have subtitles enabled.'
-          },
-          404
-        );
-      }
-      throw fetchError;
     }
 
-    if (!transcriptSegments || transcriptSegments.length === 0) {
+    if (!bestResult || bestResult.segments.length === 0) {
       return respondWithNoCredits(
-        { error: 'No transcript available for this video' },
+        { error: 'No transcript available for this video. The video may not have subtitles enabled.' },
         404
       );
     }
 
-    const rawSegments = Array.isArray(transcriptSegments)
-      ? transcriptSegments.map((item, idx) => {
-        const transformed = {
-          text: item.text || item.content || '',
-          // Convert milliseconds to seconds for offset/start
-          start:
-            (item.offset !== undefined ? item.offset / 1000 : item.start) ||
-            0,
-          // Convert milliseconds to seconds for duration
-          duration:
-            (item.duration !== undefined ? item.duration / 1000 : 0) || 0
-        };
-
-        return transformed;
-      })
-      : [];
+    const rawSegments = transformSegments(bestResult.segments);
+    const language = bestResult.language;
+    const availableLanguages = bestResult.availableLanguages;
 
     // Merge segments into complete sentences for better translation
     const mergedSentences = mergeTranscriptSegmentsIntoSentences(rawSegments);
@@ -234,11 +316,43 @@ async function handler(request: NextRequest) {
       duration: sentence.segments.reduce((sum, seg) => sum + seg.duration, 0) // Sum all durations
     }));
 
+    // Calculate transcript duration (time covered by the transcript)
+    const transcriptDuration = rawSegments.length > 0
+      ? rawSegments[rawSegments.length - 1].start + rawSegments[rawSegments.length - 1].duration
+      : 0;
+
+    // Determine if transcript might be partial
+    const coverageRatio = expectedDuration ? transcriptDuration / expectedDuration : null;
+    const isPartial = expectedDuration
+      ? transcriptDuration < expectedDuration * 0.5 // Less than 50% coverage
+      : false;
+
+    // Diagnostic logging: track processed transcript stats
+    console.log('[TRANSCRIPT] Processed transcript:', {
+      videoId,
+      rawSegmentCount: rawSegments.length,
+      mergedSegmentCount: transformedTranscript.length,
+      transcriptDuration: Math.round(transcriptDuration),
+      expectedDuration: expectedDuration ?? 'not provided',
+      coverageRatio: coverageRatio ? `${Math.round(coverageRatio * 100)}%` : 'unknown',
+      isPartial,
+      firstSegmentStart: rawSegments[0]?.start,
+      lastSegmentEnd: rawSegments.length > 0
+        ? rawSegments[rawSegments.length - 1].start + rawSegments[rawSegments.length - 1].duration
+        : 0
+    });
+
     return NextResponse.json({
       videoId,
       transcript: transformedTranscript,
       language,
-      availableLanguages
+      availableLanguages,
+      // Transcript metadata for debugging and completeness validation
+      transcriptDuration: Math.round(transcriptDuration),
+      segmentCount: transformedTranscript.length,
+      rawSegmentCount: rawSegments.length,
+      isPartial,
+      coverageRatio: coverageRatio ? Math.round(coverageRatio * 100) : undefined
     });
   } catch (error) {
     console.error('[TRANSCRIPT] Error processing transcript:', {

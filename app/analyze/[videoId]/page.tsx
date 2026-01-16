@@ -1003,11 +1003,26 @@ export default function AnalyzePage() {
       let fetchedTranscript;
       let language: string | undefined;
       let availableLanguages: string[] | undefined;
+      let transcriptDuration: number | undefined;
+      let transcriptIsPartial: boolean | undefined;
       try {
         const data = await transcriptRes.json();
         fetchedTranscript = data.transcript;
         language = data.language;
         availableLanguages = data.availableLanguages;
+        transcriptDuration = data.transcriptDuration;
+        transcriptIsPartial = data.isPartial;
+
+        // Log transcript metadata for debugging
+        if (transcriptDuration !== undefined) {
+          console.log('[Transcript] Metadata:', {
+            transcriptDuration,
+            segmentCount: data.segmentCount,
+            rawSegmentCount: data.rawSegmentCount,
+            isPartial: transcriptIsPartial,
+            coverageRatio: data.coverageRatio
+          });
+        }
       } catch (jsonError) {
         if (jsonError instanceof Error && jsonError.name === 'AbortError') {
           throw new Error("Transcript processing timed out. The video may be too long. Please try again.");
@@ -1048,6 +1063,20 @@ export default function AnalyzePage() {
       // If we didn't get video info from the separate endpoint, try to use what we have, but update the languages
       if (!fetchedVideoInfo) {
         setVideoInfo(prev => prev ? { ...prev, language, availableLanguages } : null);
+      }
+
+      // Check if transcript seems incomplete compared to video duration
+      if (transcriptDuration !== undefined && fetchedVideoInfo?.duration) {
+        const videoDuration = fetchedVideoInfo.duration;
+        const coverageRatio = transcriptDuration / videoDuration;
+        if (coverageRatio < 0.5) {
+          console.warn('[Transcript] WARNING: Transcript may be incomplete!', {
+            transcriptDuration: `${Math.round(transcriptDuration)}s (${Math.round(transcriptDuration / 60)}min)`,
+            videoDuration: `${videoDuration}s (${Math.round(videoDuration / 60)}min)`,
+            coverageRatio: `${Math.round(coverageRatio * 100)}%`,
+            message: 'The transcript covers less than 50% of the video duration. This may indicate an issue with caption availability.'
+          });
+        }
       }
 
       // Move to understanding stage
