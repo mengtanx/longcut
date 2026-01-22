@@ -20,6 +20,7 @@ import { NO_CREDITS_USED_MESSAGE } from '@/lib/no-credits-message';
 import { ensureMergedFormat } from '@/lib/transcript-format-detector';
 import { TranscriptSegment } from '@/lib/types';
 import { getGuestAccessState, recordGuestUsage, setGuestCookies } from '@/lib/guest-usage';
+import { saveVideoAnalysisWithRetry } from '@/lib/video-save-utils';
 
 type SupabaseServerClient = Awaited<ReturnType<typeof createClient>>;
 
@@ -296,23 +297,34 @@ async function handler(req: NextRequest) {
 
     // Serve cached analysis but still count credits when required
     if (!forceRegenerate && cachedVideo && cachedVideo.topics) {
-      // If user is logged in, track their access to this video atomically
+      // If user is logged in, track their access to this video with retry logic
       if (user) {
-        await supabase.rpc('insert_video_analysis_server', {
-          p_youtube_id: videoId,
-          p_title: cachedVideo.title,
-          p_author: cachedVideo.author,
-          p_duration: cachedVideo.duration,
-          p_thumbnail_url: cachedVideo.thumbnail_url,
-          p_transcript: cachedVideo.transcript,
-          p_topics: cachedVideo.topics,
-          p_summary: cachedVideo.summary || null,
-          p_suggested_questions: cachedVideo.suggested_questions || null,
-          p_model_used: cachedVideo.model_used,
-          p_user_id: user.id,
-          p_language: cachedVideo.language || null,
-          p_available_languages: cachedVideo.available_languages || null
+        const saveResult = await saveVideoAnalysisWithRetry(supabase, {
+          youtubeId: videoId,
+          title: cachedVideo.title,
+          author: cachedVideo.author,
+          duration: cachedVideo.duration,
+          thumbnailUrl: cachedVideo.thumbnail_url,
+          transcript: cachedVideo.transcript,
+          topics: cachedVideo.topics,
+          summary: cachedVideo.summary || null,
+          suggestedQuestions: cachedVideo.suggested_questions || null,
+          modelUsed: cachedVideo.model_used,
+          userId: user.id,
+          language: cachedVideo.language || null,
+          availableLanguages: cachedVideo.available_languages || null
         });
+
+        if (!saveResult.success) {
+          console.error(
+            `[video-analysis] Failed to link cached video ${videoId} to user ${user.id}:`,
+            saveResult.error
+          );
+        } else if (saveResult.retriedCount > 0) {
+          console.log(
+            `[video-analysis] Successfully saved cached video after ${saveResult.retriedCount} retries`
+          );
+        }
       }
 
       const shouldConsumeCachedCredit = Boolean(
@@ -434,26 +446,33 @@ async function handler(req: NextRequest) {
       await recordGuestUsage(guestState, { supabase });
     }
 
-    // Save analysis to database (server-side) - prevents client-side cache poisoning
-    try {
-      await supabase.rpc('insert_video_analysis_server', {
-        p_youtube_id: videoId,
-        p_title: videoInfo?.title || `YouTube Video ${videoId}`,
-        p_author: videoInfo?.author || null,
-        p_duration: videoInfo?.duration ?? 0,
-        p_thumbnail_url: videoInfo?.thumbnail || null,
-        p_transcript: transcript,
-        p_topics: topics,
-        p_summary: null, // Summary generated separately via /api/generate-summary
-        p_suggested_questions: null,
-        p_model_used: modelUsed,
-        p_user_id: user?.id || null,
-        p_language: videoInfo?.language || null,
-        p_available_languages: videoInfo?.availableLanguages || null
-      });
-    } catch (saveError) {
+    // Save analysis to database (server-side) with retry logic
+    const saveResult = await saveVideoAnalysisWithRetry(supabase, {
+      youtubeId: videoId,
+      title: videoInfo?.title || `YouTube Video ${videoId}`,
+      author: videoInfo?.author || null,
+      duration: videoInfo?.duration ?? 0,
+      thumbnailUrl: videoInfo?.thumbnail || null,
+      transcript: transcript,
+      topics: topics,
+      summary: null, // Summary generated separately via /api/generate-summary
+      suggestedQuestions: null,
+      modelUsed: modelUsed,
+      userId: user?.id || null,
+      language: videoInfo?.language || null,
+      availableLanguages: videoInfo?.availableLanguages || null
+    });
+
+    if (!saveResult.success) {
       // Log but don't fail the request - user should still see their results
-      console.error('Failed to save video analysis to cache:', saveError);
+      console.error(
+        `[video-analysis] Failed to save new video ${videoId}:`,
+        saveResult.error
+      );
+    } else if (saveResult.retriedCount > 0) {
+      console.log(
+        `[video-analysis] Successfully saved new video after ${saveResult.retriedCount} retries`
+      );
     }
 
     const response = NextResponse.json({

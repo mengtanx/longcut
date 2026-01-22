@@ -41,7 +41,8 @@ async function handler(req: NextRequest) {
       let ownedByCurrentUser = false;
 
       if (user?.id) {
-        if (cachedVideo.user_id && cachedVideo.user_id === user.id) {
+        // Check if user is the original creator via created_by column
+        if (cachedVideo.created_by && cachedVideo.created_by === user.id) {
           ownedByCurrentUser = true;
         } else {
           const ownershipQuery = supabase
