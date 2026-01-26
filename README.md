@@ -17,6 +17,10 @@ The project is a Next.js 15 + React 19 application that wraps xAI’s Grok 4 Fas
 - Aggressive caching of previous analyses, background refresh tasks, and rate limits for anonymous vs. signed-in users.
 - Security middleware that enforces CSP headers, CSRF protection, body-size caps, and Supabase-backed rate limiting.
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=SamuelZ12/tldw&type=date&legend=top-left)](https://www.star-history.com/#SamuelZ12/tldw&type=date&legend=top-left)
+
 ## Architecture
 
 - Frontend stack: Next.js 15 App Router, React 19, TypeScript, Tailwind CSS v4, shadcn/ui, lucide-react, sonner toasts.
